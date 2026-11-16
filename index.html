@@ -506,10 +506,7 @@ form { display: grid; gap: 16px; }
   </main>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
-<!-- TEMPORARY lead capture (Google Sheet). Delete this line together with the temp-lead-capture/ folder once the CRM endpoint is live. -->
-<script src="temp-lead-capture/lead-config.js"></script>
-<script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script><script>
 (() => {
   /* ===================== Lead API (CRM-ready) =====================
      Point LEAD_API.url at the CRM / backend endpoint (absolute URL, or relative for same-site).
@@ -519,16 +516,10 @@ form { display: grid; gap: 16px; }
                A 2xx carrying {"error":{…}} is treated the same (for gateways that cannot set a status code).
      Every failure is logged to the console as  [BhaGoMo lead] <CODE>: <detail>  with a details object.
      Inside the claude.ai artifact viewer (no backend there) leads go to the artifact's own database. */
-  const TEMP_LEAD_API = window.BHAGOMO_TEMP_LEAD_API; /* set by temp-lead-capture/lead-config.js, if present */
   const LEAD_API = {
-    url: "api/lead",
-    contentType: "application/json",
+    url: "api/lead",      /* replace with the webhook / API endpoint of the application */
     timeoutMs: 15000,
-    headers: {},          /* e.g. { "X-Api-Key": "…" } if the CRM gateway needs one */
-    /* Temporary Google Sheet capture overrides url/contentType only while its config has a url. */
-    ...(TEMP_LEAD_API && TEMP_LEAD_API.url
-      ? { url: TEMP_LEAD_API.url, contentType: TEMP_LEAD_API.contentType || "application/json" }
-      : {}),
+    headers: {},          /* e.g. { "X-Api-Key": "…" } if the endpoint needs one */
   };
 
   const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -641,7 +632,7 @@ form { display: grid; gap: 16px; }
     try {
       res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": LEAD_API.contentType, Accept: "application/json", ...LEAD_API.headers },
+        headers: { "Content-Type": "application/json", Accept: "application/json", ...LEAD_API.headers },
         body: JSON.stringify(lead),
         signal: ctrl.signal,
       });
@@ -665,7 +656,11 @@ form { display: grid; gap: 16px; }
     if (res.status === 409) return { result: "duplicate", status: 409, endpoint };
     const e = (body && body.error) || {};
     const code = e.code || HTTP_CODES[res.status] || (res.status >= 500 ? "SERVER_ERROR" : `HTTP_${res.status}`);
-    throw new LeadError(code, e.message || `HTTP ${res.status} ${res.statusText}`.trim(), { endpoint, status: res.status, field: e.field, response: text.slice(0, 500) });
+    /* The default relative endpoint answering 404/405 means no lead endpoint has been configured for this host. */
+    const hint = (res.status === 404 || res.status === 405) && LEAD_API.url === "api/lead"
+      ? " (No lead endpoint is configured for this site: the default \"api/lead\" does not exist here. Set LEAD_API.url to the webhook / API endpoint.)"
+      : "";
+    throw new LeadError(code, (e.message || res.statusText || "Request rejected by the server") + hint, { endpoint, status: res.status, field: e.field, response: text.slice(0, 500) });
   }
 
   async function artifactSave(lead) {
@@ -705,7 +700,9 @@ form { display: grid; gap: 16px; }
     }
   }
   function logFailure(err) {
-    console.error(`[BhaGoMo lead] ${err.code}: ${err.message}`, {
+    /* The HTTP status leads the line (e.g. "HTTP 403 FORBIDDEN"); "no HTTP response" means the request never got one (network/CORS/timeout). */
+    const status = err.status ? `HTTP ${err.status}` : "no HTTP response";
+    console.error(`[BhaGoMo lead] ${status} ${err.code}: ${err.message}`, {
       code: err.code,
       httpStatus: err.status ?? null,
       endpoint: err.endpoint ?? null,
@@ -744,11 +741,15 @@ form { display: grid; gap: 16px; }
       submittedAt: new Date().toISOString(),
       source: "web-lead-form",
     };
-    if (readSent().includes(lead.phone)) { goThanks(lead, true); return; }
+    if (readSent().includes(lead.phone)) {
+      console.info("[BhaGoMo lead] DUPLICATE (this browser already sent this number, so no request was made)");
+      goThanks(lead, true);
+      return;
+    }
     inFlight = true; setBusy(true);
     try {
       const r = await saveLead(lead);
-      console.info(`[BhaGoMo lead] ${r.result.toUpperCase()}`, { httpStatus: r.status ?? null, endpoint: r.endpoint });
+      console.info(`[BhaGoMo lead] ${r.status ? `HTTP ${r.status} ` : ""}${r.result.toUpperCase()}`, { httpStatus: r.status ?? null, endpoint: r.endpoint });
       markSent(lead.phone);
       goThanks(lead, r.result === "duplicate"); /* stays busy while the page hands over */
     } catch (err) {
@@ -764,7 +765,7 @@ form { display: grid; gap: 16px; }
       msg.replaceChildren(userMessage(err));
       const ref = document.createElement("span");
       ref.className = "msg-code";
-      ref.textContent = `Error code: ${err.code}`;
+      ref.textContent = err.status ? `Error code: ${err.status} ${err.code}` : `Error code: ${err.code}`;
       msg.append(ref);
       msg.hidden = false;
       if (!(err.code === "VALIDATION_FAILED" && err.field)) msg.scrollIntoView({ block: "nearest", behavior: reduced ? "auto" : "smooth" });
@@ -779,10 +780,25 @@ form { display: grid; gap: 16px; }
   const thanks = document.getElementById("thanks");
   const tyMark = document.getElementById("tyMark");
   const baseTitle = document.title;
-  let lastThanks = null;
-  try { if (location.hash === "#thank-you") history.replaceState(null, "", location.pathname + location.search); } catch {}
+  const TY_HASH = "#thank-you";
+  const TY_KEY = "bhagomo-iride-thanks"; /* this tab only: lets a refresh of #thank-you keep the visitor's details */
+  const summary = thanks.querySelector(".summary");
+
+  function lastLead() {
+    try { return JSON.parse(sessionStorage.getItem(TY_KEY) || "null"); } catch { return null; }
+  }
+
+  /* Opened directly (bookmark, shared link, new tab): no enquiry details to show, so keep the message general. */
+  function fillThanksGeneric() {
+    document.getElementById("tyTitle").textContent = "Thank you.";
+    document.getElementById("tyLede").textContent =
+      "Your ride from the Metro is one step closer. The BhaGoMo iRide team will be in touch with you shortly to help you with the next step.";
+    summary.hidden = true;
+    document.title = "Thank you · BhaGoMo iRide";
+  }
 
   function fillThanks(lead, dup) {
+    summary.hidden = false;
     const first = lead.name.split(" ")[0];
     const title = dup ? `Already noted, ${first}.` : `Thank you, ${first}.`;
     document.getElementById("tyTitle").textContent = title;
@@ -802,7 +818,7 @@ form { display: grid; gap: 16px; }
     formPage.hidden = true; thanks.hidden = false;
     if (G) G.set(formPage, { clearProps: "opacity,transform" });
     window.scrollTo(0, 0);
-    if (push) { try { history.pushState({ ty: 1 }, "", "#thank-you"); } catch {} }
+    if (push) { try { history.pushState({ ty: 1 }, "", TY_HASH); } catch {} }
     document.getElementById("tyContent").focus({ preventScroll: true });
     inFlight = false; setBusy(false);
     tyMark.classList.remove("play");
@@ -821,7 +837,10 @@ form { display: grid; gap: 16px; }
   }
 
   function goThanks(lead, dup) {
-    lastThanks = true;
+    try {
+      sessionStorage.setItem(TY_KEY, JSON.stringify({
+        name: lead.name, phone: lead.phone, station: lead.station, planHours: lead.planHours, dup: !!dup }));
+    } catch {}
     fillThanks(lead, dup);
     if (animate) G.to(formPage, { opacity: 0, y: -6, duration: .25, ease: "power2.in", onComplete: () => openThanks(true) });
     else openThanks(true);
@@ -839,14 +858,26 @@ form { display: grid; gap: 16px; }
     window.scrollTo(0, 0);
   }
 
+  /* The URL decides the view, so <page>#thank-you can be opened directly, refreshed, or reached with Back/Forward. */
+  function route() {
+    if (location.hash === TY_HASH) {
+      if (!thanks.hidden) return;
+      const last = lastLead();
+      if (last) fillThanks(last, last.dup); else fillThanksGeneric();
+      openThanks(false);
+    } else if (!thanks.hidden) {
+      showForm();
+    }
+  }
+
   document.getElementById("again").addEventListener("click", () => {
-    if (history.state && history.state.ty) history.back(); /* popstate shows the form */
-    else showForm();
+    if (history.state && history.state.ty) { history.back(); return; } /* popstate shows the form */
+    try { history.pushState(null, "", location.pathname + location.search); } catch {}
+    showForm();
   });
-  window.addEventListener("popstate", (e) => {
-    if (e.state && e.state.ty && lastThanks) { if (thanks.hidden) openThanks(false); }
-    else if (!thanks.hidden) showForm();
-  });
+  window.addEventListener("popstate", route);
+  window.addEventListener("hashchange", route);
+  route();
 })();
 </script>
 </body>
