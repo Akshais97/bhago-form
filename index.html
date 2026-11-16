@@ -507,6 +507,8 @@ form { display: grid; gap: 16px; }
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<!-- TEMPORARY lead capture (Google Sheet). Delete this line together with the temp-lead-capture/ folder once the CRM endpoint is live. -->
+<script src="temp-lead-capture/lead-config.js"></script>
 <script>
 (() => {
   /* ===================== Lead API (CRM-ready) =====================
@@ -514,12 +516,19 @@ form { display: grid; gap: 16px; }
      Request : POST <url>   Content-Type: application/json   body: the `lead` object built on submit
      Success : 2xx  {"status":"saved"}  or  {"status":"duplicate"}        (HTTP 409 is also read as duplicate)
      Failure : non-2xx  {"error":{"code":"VALIDATION_FAILED","message":"…","field":"phone"}}  (field optional)
+               A 2xx carrying {"error":{…}} is treated the same (for gateways that cannot set a status code).
      Every failure is logged to the console as  [BhaGoMo lead] <CODE>: <detail>  with a details object.
      Inside the claude.ai artifact viewer (no backend there) leads go to the artifact's own database. */
+  const TEMP_LEAD_API = window.BHAGOMO_TEMP_LEAD_API; /* set by temp-lead-capture/lead-config.js, if present */
   const LEAD_API = {
     url: "api/lead",
+    contentType: "application/json",
     timeoutMs: 15000,
     headers: {},          /* e.g. { "X-Api-Key": "…" } if the CRM gateway needs one */
+    /* Temporary Google Sheet capture overrides url/contentType only while its config has a url. */
+    ...(TEMP_LEAD_API && TEMP_LEAD_API.url
+      ? { url: TEMP_LEAD_API.url, contentType: TEMP_LEAD_API.contentType || "application/json" }
+      : {}),
   };
 
   const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -632,7 +641,7 @@ form { display: grid; gap: 16px; }
     try {
       res = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json", ...LEAD_API.headers },
+        headers: { "Content-Type": LEAD_API.contentType, Accept: "application/json", ...LEAD_API.headers },
         body: JSON.stringify(lead),
         signal: ctrl.signal,
       });
@@ -648,6 +657,9 @@ form { display: grid; gap: 16px; }
     try { body = text ? JSON.parse(text) : null; } catch { /* non-JSON body, reported below */ }
     if (res.ok) {
       if (body && (body.status === "saved" || body.status === "duplicate")) return { result: body.status, status: res.status, endpoint };
+      if (body && body.error && body.error.code) {
+        throw new LeadError(String(body.error.code), body.error.message || `HTTP ${res.status} with an error body`, { endpoint, status: res.status, field: body.error.field, response: text.slice(0, 500) });
+      }
       throw new LeadError("BAD_RESPONSE", `HTTP ${res.status} but the body is not {"status":"saved"|"duplicate"}.`, { endpoint, status: res.status, response: text.slice(0, 500) });
     }
     if (res.status === 409) return { result: "duplicate", status: 409, endpoint };
